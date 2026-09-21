@@ -41,6 +41,10 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().
 app = Flask(__name__)
 tg_app: Application | None = None
 bot_loop: asyncio.AbstractEventLoop | None = None
+bot_start_thread: threading.Thread | None = None
+bot_ready = threading.Event()
+bot_start_error: str | None = None
+bot_start_lock = threading.Lock()
 started_at = time.time()
 last_request = time.time()
 rate_state: dict[int, float] = {}
@@ -242,6 +246,7 @@ async def run_download(query, context: ContextTypes.DEFAULT_TYPE, mode: str, url
                 loop,
             )
 
+    media = None
     try:
         media, info, thumb = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: download_media(url, mode, progress)),
@@ -325,25 +330,47 @@ def build_bot() -> Application:
     return application
 
 def bot_thread():
-    global bot_loop, tg_app
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
-    tg_app = build_bot()
+    global bot_loop, tg_app, bot_start_error
+    try:
+        bot_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(bot_loop)
+        tg_app = build_bot()
 
-    async def init():
-        await tg_app.initialize()
-        await tg_app.start()
-        webhook_url = f"{WEBHOOK_BASE_URL}/telegram/webhook/{WEBHOOK_SECRET}"
-        await tg_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        log.info("Telegram webhook configured: %s", webhook_url)
+        async def init():
+            await tg_app.initialize()
+            await tg_app.start()
+            webhook_url = f"{WEBHOOK_BASE_URL}/telegram/webhook/{WEBHOOK_SECRET}"
+            await tg_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+            log.info("Telegram webhook configured: %s", webhook_url)
 
-    bot_loop.run_until_complete(init())
-    bot_loop.run_forever()
+        bot_loop.run_until_complete(init())
+        bot_ready.set()
+        bot_loop.run_forever()
+    except Exception as exc:
+        bot_start_error = str(exc)
+        log.exception("Telegram bot thread failed to start")
+        bot_ready.set()
+        raise
+
+
+def ensure_bot_started(wait: float = 15.0) -> bool:
+    global bot_start_thread
+    if not BOT_TOKEN or not WEBHOOK_BASE_URL or not WEBHOOK_SECRET:
+        return False
+    if bot_ready.is_set() and tg_app is not None and bot_loop is not None and not bot_loop.is_closed():
+        return True
+    with bot_start_lock:
+        if bot_start_thread is None or not bot_start_thread.is_alive():
+            bot_ready.clear()
+            bot_start_thread = threading.Thread(target=bot_thread, daemon=True, name="telegram-bot")
+            bot_start_thread.start()
+    bot_ready.wait(timeout=wait)
+    return tg_app is not None and bot_loop is not None and not bot_loop.is_closed()
 
 @app.get("/")
 def home():
@@ -351,10 +378,13 @@ def home():
 
 @app.get("/health")
 def health():
+    ready = ensure_bot_started(wait=15.0) if BOT_TOKEN else False
     return jsonify({
         "status": "ok",
         "bot_configured": bool(BOT_TOKEN),
         "webhook_configured": bool(WEBHOOK_BASE_URL and WEBHOOK_SECRET),
+        "telegram_ready": ready,
+        "telegram_error": bot_start_error,
         "uptime_seconds": int(time.time() - started_at),
         "last_request_age": int(time.time() - last_request),
     })
@@ -365,7 +395,9 @@ def telegram_webhook(secret: str):
     last_request = time.time()
     if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
         return ("not found", 404)
-    if not tg_app or not bot_loop:
+    if not ensure_bot_started(wait=15.0):
+        log.error("Telegram webhook unavailable: bot_ready=%s tg_app=%s bot_loop=%s error=%s",
+                  bot_ready.is_set(), tg_app is not None, bot_loop is not None, bot_start_error)
         return ("starting", 503)
     try:
         data = request.get_json(force=True)
@@ -378,8 +410,6 @@ def telegram_webhook(secret: str):
 
 if not BOT_TOKEN:
     log.warning("BOT_TOKEN is not set. Add it as a Render secret before expecting Telegram updates.")
-else:
-    threading.Thread(target=bot_thread, daemon=True, name="telegram-bot").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
