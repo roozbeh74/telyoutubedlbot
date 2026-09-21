@@ -290,6 +290,12 @@ def ensure_bot_started(wait=15):
     return bot_ready.is_set()
 
 
+# Start the Telegram webhook worker when the web process boots.
+# This is required because Telegram cannot call the webhook until set_webhook() has run.
+if BOT_TOKEN and WEBHOOK_SECRET and WEBHOOK_BASE_URL:
+    ensure_bot_started(wait=0)
+
+
 @app.get("/")
 def home(): return jsonify({"service": "download-center", "status": "ok"})
 
