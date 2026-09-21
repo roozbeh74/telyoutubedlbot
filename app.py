@@ -402,7 +402,9 @@ def telegram_webhook(secret: str):
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, tg_app.bot)
-        bot_loop.call_soon_threadsafe(tg_app.update_queue.put_nowait, update)
+        future = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), bot_loop)
+        future.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+        log.info("Telegram update accepted: update_id=%s", data.get("update_id"))
         return ("ok", 200)
     except Exception:
         log.exception("webhook error")
